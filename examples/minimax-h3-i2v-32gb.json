@@ -1,0 +1,56 @@
+{
+  "ops": [
+    {
+      "id": "MiniMaxH3-i2v-comfy",
+      "args": {
+        "gpu": true,
+        "image": "docker.io/nosana/comfyui:2.0.11",
+        "expose": 8188,
+        "resources": [
+          {
+            "repo": "Comfy-Org/MiniMax-H3",
+            "type": "HF",
+            "files": [
+              "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+            ],
+            "target": "/comfyui/models/diffusion_models/"
+          },
+          {
+            "repo": "Comfy-Org/MiniMax-H3",
+            "type": "HF",
+            "files": [
+              "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+            ],
+            "target": "/comfyui/models/text_encoders/"
+          },
+          {
+            "repo": "Comfy-Org/MiniMax-H3",
+            "type": "HF",
+            "files": [
+              "vae/minimax_h3_video_vae_fp16.safetensors",
+              "vae/minimax_h3_audio_vae_fp32.safetensors"
+            ],
+            "target": "/comfyui/models/vae/"
+          },
+          {
+            "repo": "lightx2v/Minimax-h3-Turbo",
+            "type": "HF",
+            "files": [
+              "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
+            ],
+            "target": "/comfyui/models/loras/"
+          }
+        ]
+      },
+      "type": "container/run"
+    }
+  ],
+  "meta": {
+    "trigger": "cli",
+    "system_requirements": {
+      "vram_total_mb": 30720
+    }
+  },
+  "type": "container",
+  "version": "0.1"
+}

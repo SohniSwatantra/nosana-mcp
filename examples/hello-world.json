@@ -1,0 +1,18 @@
+{
+  "ops": [
+    {
+      "id": "Hello-world",
+      "args": {
+        "cmd": "echo hello world",
+        "gpu": true,
+        "image": "ubuntu"
+      },
+      "type": "container/run"
+    }
+  ],
+  "meta": {
+    "trigger": "cli"
+  },
+  "type": "container",
+  "version": "0.1"
+}

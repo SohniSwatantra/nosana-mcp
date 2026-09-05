@@ -1,0 +1,65 @@
+{
+  "name": "nosana-mcp",
+  "version": "0.1.0",
+  "description": "Nosana MCP: let AI agents rent GPUs on the Nosana network and deploy templates such as MiniMax H3 with account credits. Ships the nosana-deploy CLI too.",
+  "type": "module",
+  "bin": {
+    "nosana-mcp": "./dist/mcp/index.js",
+    "nosana-deploy": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev:mcp": "tsx src/mcp/index.ts",
+    "dev:cli": "tsx src/cli/index.ts",
+    "start": "node dist/mcp/index.js",
+    "test:mcp": "node scripts/smoke-mcp.mjs",
+    "inspect": "npx -y @modelcontextprotocol/inspector node dist/mcp/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "mcpName": "io.github.SohniSwatantra/nosana-mcp",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "nosana",
+    "gpu",
+    "ai-agents",
+    "minimax",
+    "comfyui",
+    "claude",
+    "deploy"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SohniSwatantra/nosana-mcp.git"
+  },
+  "homepage": "https://github.com/SohniSwatantra/nosana-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/SohniSwatantra/nosana-mcp/issues"
+  },
+  "author": "Swatantra Sohni",
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.7.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@nosana/kit": "^2.11.2",
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

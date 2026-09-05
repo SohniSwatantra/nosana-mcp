@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: MCP server starts and lists tools
+        run: |
+          node -e '
+          const { spawn } = require("node:child_process");
+          const p = spawn("node", ["dist/mcp/index.js"], { stdio: ["pipe", "pipe", "inherit"] });
+          let out = "";
+          p.stdout.on("data", (d) => { out += d; if (out.includes("\"tools\"")) { console.log("tools/list ok"); p.kill(); process.exit(0); } });
+          p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "ci", version: "0" } } }) + "\n");
+          p.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+          p.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
+          setTimeout(() => { console.error("no tools/list response"); p.kill(); process.exit(1); }, 15000);
+          '
