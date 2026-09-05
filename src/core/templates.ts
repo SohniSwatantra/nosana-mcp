@@ -1,5 +1,6 @@
 import type { JobDefinition, NosanaClient } from '@nosana/kit';
 import { CliError } from './client.js';
+import { withRetry } from './format.js';
 
 export interface TemplateVariant {
   id: string;
@@ -77,7 +78,7 @@ function normalize(raw: RawTemplate): TemplateInfo {
 }
 
 export async function listTemplates(client: NosanaClient): Promise<TemplateInfo[]> {
-  const raw = (await client.api.templates.list()) as unknown;
+  const raw = (await withRetry(() => client.api.templates.list())) as unknown;
   return (Array.isArray(raw) ? (raw as RawTemplate[]) : []).map(normalize);
 }
 
@@ -204,4 +205,58 @@ export function exposesPorts(definition: JobDefinition): boolean {
 export function vramFromDefinition(definition: JobDefinition): number | null {
   const mb = (definition as MetaWithRequirements).meta?.system_requirements?.vram_total_mb;
   return typeof mb === 'number' && mb > 0 ? Math.ceil(mb / 1024) : null;
+}
+
+export type WorkloadKind = 'comfyui' | 'llm' | 'notebook' | 'ide' | 'asr' | 'webui' | 'custom';
+export type LlmFlavor = 'ollama' | 'vllm' | 'other';
+
+type OpLike = { id?: string; args?: { image?: string; expose?: unknown; resources?: { type?: string }[] } };
+const opsOf = (definition: JobDefinition): OpLike[] => ((definition as { ops?: OpLike[] }).ops ?? []);
+
+export function kindOfDefinition(definition: JobDefinition, category: string[] = []): WorkloadKind {
+  const images = opsOf(definition).map((op) => op.args?.image ?? '').join(' ').toLowerCase();
+  if (/comfyui/.test(images)) return 'comfyui';
+  if (/ollama|vllm|text-generation|sglang|llama\.cpp|lmdeploy/.test(images) || category.includes('LLM')) return 'llm';
+  if (/jupyter/.test(images)) return 'notebook';
+  if (/vscode|code-server|rstudio/.test(images)) return 'ide';
+  if (/whisper/.test(images) || category.includes('ASR')) return 'asr';
+  if (category.includes('Web UI')) return 'webui';
+  return 'custom';
+}
+
+export function llmFlavor(definition: JobDefinition): LlmFlavor {
+  const images = opsOf(definition).map((op) => op.args?.image ?? '').join(' ').toLowerCase();
+  if (/ollama/.test(images)) return 'ollama';
+  if (/vllm/.test(images)) return 'vllm';
+  return 'other';
+}
+
+/** Ports a job definition exposes, from `expose: 8188`, `expose: { port }` or an array of either. */
+export function exposedPorts(definition: JobDefinition): number[] {
+  const ports: number[] = [];
+  for (const op of opsOf(definition)) {
+    const raw = op.args?.expose;
+    const items = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw];
+    for (const item of items) {
+      const port = typeof item === 'number' ? item : typeof item === 'string' ? Number(item) : Number((item as { port?: unknown })?.port);
+      if (Number.isFinite(port) && port > 0) ports.push(port);
+    }
+  }
+  return [...new Set(ports)];
+}
+
+export const primaryOpId = (definition: JobDefinition): string | null => opsOf(definition)[0]?.id ?? null;
+
+/** URL path that proves the service itself (not just the tunnel) answers. */
+export function readinessPath(kind: WorkloadKind, flavor: LlmFlavor = 'other'): string {
+  if (kind === 'llm') return flavor === 'ollama' ? '/api/tags' : '/v1/models';
+  return '/';
+}
+
+/** Rough time from "host assigned" to "service answers", driven by what has to be downloaded first. */
+export function typicalBootMinutes(definition: JobDefinition, kind: WorkloadKind): number {
+  const resources = opsOf(definition).flatMap((op) => op.args?.resources ?? []);
+  if (resources.some((r) => r.type === 'HF' || r.type === 'S3')) return 10;
+  if (resources.some((r) => r.type === 'Ollama') || kind === 'llm') return 5;
+  return 2;
 }

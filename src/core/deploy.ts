@@ -2,9 +2,9 @@ import type { JobDefinition, NosanaClient } from '@nosana/kit';
 import pc from 'picocolors';
 import { CliError, type ApiDeployment, type CreateDeploymentBody } from './client.js';
 import type { Network } from './config.js';
-import { elapsed, fmtDate, short, sleep, statusColor, table } from './format.js';
+import { elapsed, fmtDate, short, sleep, statusColor, table, withRetry } from './format.js';
 import { fitsVram, type GpuMarket, type GpuTableOptions } from './markets.js';
-import { exposesPorts } from './templates.js';
+import { exposesPorts, kindOfDefinition, llmFlavor, readinessPath, typicalBootMinutes, type WorkloadKind } from './templates.js';
 
 export type Strategy = 'SIMPLE' | 'SIMPLE-EXTEND' | 'SCHEDULED' | 'INFINITE';
 
@@ -52,7 +52,12 @@ export interface PlanAssessment {
   cost: CostEstimate;
 }
 
-export function assessPlan(plan: DeployPlan, fit: GpuTableOptions, creditsAvailable: number): PlanAssessment {
+export interface AssessOptions {
+  /** Treat "no idle host" as blocking (agents must get explicit consent to queue). */
+  requireIdle?: boolean;
+}
+
+export function assessPlan(plan: DeployPlan, fit: GpuTableOptions, creditsAvailable: number, options: AssessOptions = {}): PlanAssessment {
   const blocking: string[] = [];
   const advisories: string[] = [];
   const gpu = plan.gpu;
@@ -67,7 +72,9 @@ export function assessPlan(plan: DeployPlan, fit: GpuTableOptions, creditsAvaila
     blocking.push(`Estimated ${cost.total.toFixed(3)} credits exceed the ${creditsAvailable.toFixed(3)} available. Top up at https://deploy.nosana.com (Billing).`);
   }
   if (gpu.availableNodes === 0) {
-    advisories.push(`No idle ${gpu.name} host right now; the job will queue until one frees up.`);
+    const note = `No idle ${gpu.name} host right now; the job would queue until one frees up.`;
+    if (options.requireIdle) blocking.push(`${note} Pass accept_queue=true if the user agrees to wait, or pick a GPU from ready_now.`);
+    else advisories.push(note);
   }
   return { blocking, advisories, warnings: [...blocking, ...advisories], cost };
 }
@@ -202,8 +209,125 @@ export interface WaitOptions {
 export type WaitOutcome =
   | { kind: 'online'; deployment: ApiDeployment; readyUrls: string[] }
   | { kind: 'completed'; deployment: ApiDeployment; job: string }
+  | { kind: 'stopped'; deployment: ApiDeployment }
   | { kind: 'failed'; deployment: ApiDeployment; reason: string; error?: string }
-  | { kind: 'timeout'; deployment: ApiDeployment };
+  | { kind: 'timeout'; deployment: ApiDeployment; phase: DeploymentPhase };
+
+export type DeploymentPhase = 'draft' | 'scheduling' | 'queued' | 'starting' | 'initializing' | 'ready' | 'completed' | 'stopped' | 'error';
+
+export interface DefinitionFacts {
+  jobDefinition: JobDefinition | null;
+  exposes: boolean;
+  kind: WorkloadKind;
+  readinessPath: string;
+  bootMinutes: number;
+  opId: string | null;
+}
+
+export async function inspectDefinition(dep: ApiDeployment): Promise<DefinitionFacts> {
+  let definition: JobDefinition | null = null;
+  try {
+    const revisions = await dep.getRevisions({ limit: 10 });
+    const items = revisions.revisions as { revision: number; job_definition?: unknown }[];
+    const active = items.find((r) => r.revision === dep.active_revision) ?? items[0];
+    if (active?.job_definition) definition = active.job_definition as JobDefinition;
+  } catch {
+    /* fall through */
+  }
+  if (!definition) {
+    return { jobDefinition: null, exposes: (dep.endpoints?.length ?? 0) > 0, kind: 'custom', readinessPath: '/', bootMinutes: 3, opId: dep.endpoints?.[0]?.opId ?? null };
+  }
+  const kind = kindOfDefinition(definition);
+  const ops = (definition as { ops?: { id?: string }[] }).ops ?? [];
+  return {
+    jobDefinition: definition,
+    exposes: exposesPorts(definition),
+    kind,
+    readinessPath: readinessPath(kind, llmFlavor(definition)),
+    bootMinutes: typicalBootMinutes(definition, kind),
+    opId: ops[0]?.id ?? null,
+  };
+}
+
+/** Where a deployment is in its life, derived from status, jobs and endpoint probes. */
+export function computePhase(
+  dep: ApiDeployment,
+  jobs: { state: unknown; node?: string | null }[],
+  endpoints: { tunnel_online: boolean; service_ready: boolean }[],
+  exposes: boolean,
+): DeploymentPhase {
+  if (dep.status === 'DRAFT') return 'draft';
+  if (dep.status === 'ERROR' || dep.status === 'INSUFFICIENT_FUNDS') return 'error';
+  const states = jobs.map((j) => normalizeJobState(j.state));
+  if (states.includes('COMPLETED') && !exposes) return 'completed';
+  if (TERMINAL_STATUSES.has(dep.status)) return 'stopped';
+  if (endpoints.some((e) => e.service_ready)) return 'ready';
+  if (states.includes('RUNNING')) return endpoints.some((e) => e.tunnel_online) ? 'initializing' : 'starting';
+  if (states.includes('QUEUED')) return 'queued';
+  return 'scheduling';
+}
+
+export const PHASE_HINTS: Record<DeploymentPhase, { message: string; pollAfterSeconds: number }> = {
+  draft: { message: 'Created but not started.', pollAfterSeconds: 0 },
+  scheduling: { message: 'Nosana is listing the job on the market.', pollAfterSeconds: 10 },
+  queued: { message: 'Job is queued, waiting for an idle host on this GPU market.', pollAfterSeconds: 30 },
+  starting: { message: 'A host picked the job and is pulling the image and any model weights before the container opens its tunnel.', pollAfterSeconds: 20 },
+  initializing: { message: 'Tunnel is up; the service is still starting (downloading weights or loading the model).', pollAfterSeconds: 30 },
+  ready: { message: 'The service answers.', pollAfterSeconds: 0 },
+  completed: { message: 'The job finished.', pollAfterSeconds: 0 },
+  stopped: { message: 'The deployment is stopped (by the user or by its timeout), not failed.', pollAfterSeconds: 0 },
+  error: { message: 'The deployment is in an error state.', pollAfterSeconds: 0 },
+};
+
+export interface EndpointSnapshot {
+  url: string;
+  op: string;
+  port: number | string;
+  tunnel_online: boolean;
+  service_ready: boolean;
+}
+
+export interface DeploymentSnapshot {
+  deployment: ApiDeployment;
+  facts: DefinitionFacts;
+  phase: DeploymentPhase;
+  endpoints: EndpointSnapshot[];
+  readyUrls: string[];
+  jobs: { job: string; state: string; node: string | null; created_at?: string; time_start?: number }[];
+  events: { at?: string; type?: string; message?: string }[];
+  elapsedSeconds: number;
+}
+
+export async function snapshotDeployment(client: NosanaClient, id: string, facts?: DefinitionFacts): Promise<DeploymentSnapshot> {
+  const dep = (await withRetry(() => client.api.deployments.get(id))) as ApiDeployment;
+  const resolvedFacts = facts ?? (await inspectDefinition(dep));
+  const [jobsRaw, eventsRaw] = await Promise.all([
+    dep.getJobs({ limit: 10 }).then((r) => r.jobs as { job: string; state: unknown; node?: string | null; created_at?: string; time_start?: number }[]).catch(() => []),
+    dep.getEvents({ limit: 10, sort_order: 'desc' }).then((r) => r.events as { created_at?: string; type?: string; message?: string }[]).catch(() => []),
+  ]);
+  const endpoints: EndpointSnapshot[] = await Promise.all(
+    (dep.endpoints ?? []).map(async (e) => ({
+      url: e.url,
+      op: e.opId,
+      port: e.port,
+      tunnel_online: e.online,
+      service_ready: e.online ? (await probeEndpoint(e.url, resolvedFacts.readinessPath)) === 'ready' : false,
+    })),
+  );
+  const jobs = jobsRaw.slice(0, 5).map((j) => ({ job: j.job, state: normalizeJobState(j.state), node: j.node ?? null, created_at: j.created_at, time_start: j.time_start }));
+  const running = jobsRaw.find((j) => normalizeJobState(j.state) === 'RUNNING' && j.time_start);
+  const since = running?.time_start ? running.time_start * 1000 : new Date(dep.updated_at ?? dep.created_at).getTime();
+  return {
+    deployment: dep,
+    facts: resolvedFacts,
+    phase: computePhase(dep, jobsRaw, endpoints, resolvedFacts.exposes),
+    endpoints,
+    readyUrls: endpoints.filter((e) => e.service_ready).map((e) => e.url),
+    jobs,
+    events: eventsRaw.slice(0, 5).map((e) => ({ at: e.created_at, type: e.type, message: e.message })),
+    elapsedSeconds: Math.max(0, Math.round((Date.now() - since) / 1000)),
+  };
+}
 
 type EventLike = { type?: string; event?: string; message?: string; created_at?: string };
 type JobLike = { job: string; state: unknown; node?: string | null };
@@ -225,26 +349,15 @@ export type EndpointProbe = 'ready' | 'initializing' | 'unreachable';
  * long before the container does: Nosana then serves a 503 "Service Initializing" page. Probe the URL
  * so "online" means the workload itself responds.
  */
-export async function probeEndpoint(url: string): Promise<EndpointProbe> {
+export async function probeEndpoint(url: string, path = '/'): Promise<EndpointProbe> {
   try {
-    const response = await fetch(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(10_000) });
+    const target = path === '/' ? url : `${url.replace(/\/$/, '')}${path}`;
+    const response = await fetch(target, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(10_000) });
     if (response.status === 502 || response.status === 503 || response.status === 504) return 'initializing';
     return 'ready';
   } catch {
     return 'unreachable';
   }
-}
-
-async function detectExposure(dep: ApiDeployment): Promise<boolean> {
-  try {
-    const revisions = await dep.getRevisions({ limit: 10 });
-    const items = revisions.revisions as { revision: number; job_definition?: unknown }[];
-    const active = items.find((r) => r.revision === dep.active_revision) ?? items[0];
-    if (active?.job_definition) return exposesPorts(active.job_definition as JobDefinition);
-  } catch {
-    /* fall through */
-  }
-  return (dep.endpoints?.length ?? 0) > 0;
 }
 
 export async function waitForDeployment(client: NosanaClient, id: string, options: WaitOptions): Promise<WaitOutcome> {
@@ -256,9 +369,10 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
   const endpointStates = new Map<string, boolean>();
   const errorCounts = new Map<string, number>();
   let lastStatus = '';
-  let expectEndpoint: boolean | null = null;
+  let facts: DefinitionFacts | null = null;
   let firstPass = true;
   let lastInitializingLog = 0;
+  let lastPhase: DeploymentPhase = 'scheduling';
   const log = (message: string): void => {
     const line = `${pc.dim(elapsed(startedAt))}  ${message}`;
     if (options.onLog) options.onLog(line);
@@ -282,7 +396,8 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
       await sleep(interval);
       continue;
     }
-    if (expectEndpoint === null) expectEndpoint = await detectExposure(dep);
+    if (facts === null) facts = await inspectDefinition(dep);
+    const expectEndpoint = facts.exposes;
     if (dep.status !== lastStatus) {
       log(`deployment ${statusColor(dep.status)}`);
       lastStatus = dep.status;
@@ -312,9 +427,11 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
       /* events are informational only */
     }
 
+    let jobsSeen: JobLike[] = [];
     try {
       const list = await dep.getJobs({ limit: 20 });
-      for (const raw of list.jobs as JobLike[]) {
+      jobsSeen = list.jobs as JobLike[];
+      for (const raw of jobsSeen) {
         const state = normalizeJobState(raw.state);
         if (jobStates.get(raw.job) !== state) {
           jobStates.set(raw.job, state);
@@ -336,7 +453,8 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
     if (expectEndpoint) {
       const online = (dep.endpoints ?? []).filter((e) => e.online);
       if (online.length) {
-        const probes = await Promise.all(online.map(async (e) => ({ url: e.url, state: await probeEndpoint(e.url) })));
+        const readiness = facts.readinessPath;
+        const probes = await Promise.all(online.map(async (e) => ({ url: e.url, state: await probeEndpoint(e.url, readiness) })));
         const ready = probes.filter((p) => p.state === 'ready').map((p) => p.url);
         if (ready.length) return { kind: 'online', deployment: dep, readyUrls: [...new Set(ready)] };
         if (Date.now() - lastInitializingLog >= 60_000) {
@@ -350,9 +468,16 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
     if (TERMINAL_STATUSES.has(dep.status)) {
       const completed = [...jobStates.entries()].find(([, state]) => state === 'COMPLETED');
       if (completed && !expectEndpoint) return { kind: 'completed', deployment: dep, job: completed[0] };
+      if (dep.status === 'STOPPED' || dep.status === 'ARCHIVED') return { kind: 'stopped', deployment: dep };
       return { kind: 'failed', deployment: dep, reason: dep.status };
     }
-    if (Date.now() >= deadline) return { kind: 'timeout', deployment: dep };
+    lastPhase = computePhase(
+      dep,
+      jobsSeen,
+      (dep.endpoints ?? []).map((e) => ({ tunnel_online: e.online, service_ready: false })),
+      expectEndpoint,
+    );
+    if (Date.now() >= deadline) return { kind: 'timeout', deployment: dep, phase: lastPhase };
     firstPass = false;
     await sleep(interval);
   }

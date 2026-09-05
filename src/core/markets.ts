@@ -1,6 +1,6 @@
 import type { NosanaClient } from '@nosana/kit';
 import pc from 'picocolors';
-import { table, usd, withTimeout } from './format.js';
+import { table, usd, withRetry, withTimeout } from './format.js';
 
 export interface GpuMarket {
   slug: string;
@@ -53,8 +53,8 @@ export interface CatalogOptions {
 
 export async function loadGpuCatalog(client: NosanaClient, options: CatalogOptions = {}): Promise<GpuMarket[]> {
   const [rawMarkets, rawQueued] = await Promise.all([
-    client.api.markets.list() as Promise<unknown>,
-    (client.api.hosts.getQueuedNodes() as Promise<unknown>).catch(() => []),
+    withRetry(() => client.api.markets.list()) as Promise<unknown>,
+    (withRetry(() => client.api.hosts.getQueuedNodes()) as Promise<unknown>).catch(() => []),
   ]);
   const markets = (Array.isArray(rawMarkets) ? rawMarkets : []) as RawMarket[];
   const queuedNodes = (Array.isArray(rawQueued) ? rawQueued : []) as RawQueuedNode[];
@@ -152,4 +152,59 @@ export function gpuTable(catalog: GpuMarket[], options: GpuTableOptions = {}): s
     return row;
   });
   return table(headers, rows);
+}
+
+export type GpuBucketName = 'ready_now' | 'fits_but_queued' | 'idle_with_risk' | 'unsupported' | 'too_small';
+
+export interface GpuFitRequirements {
+  minVramGb?: number | null;
+  /** The workload only runs on Blackwell cards (RTX 5090, RTX PRO 6000). */
+  blackwellOnly?: boolean;
+  isBlackwell?: (market: GpuMarket) => boolean;
+}
+
+export interface BucketedGpu {
+  market: GpuMarket;
+  bucket: GpuBucketName;
+  risks: string[];
+}
+
+export interface GpuBuckets {
+  ready_now: BucketedGpu[];
+  fits_but_queued: BucketedGpu[];
+  idle_with_risk: BucketedGpu[];
+  unsupported: BucketedGpu[];
+  too_small: BucketedGpu[];
+}
+
+/**
+ * Sort GPUs the way a careful buyer would: fits and idle first, then fits but queued, then idle with a caveat.
+ * Hard incompatibilities (wrong architecture, too little VRAM) are kept apart so nobody "forces" them by accident.
+ */
+export function bucketGpus(catalog: GpuMarket[], req: GpuFitRequirements = {}): GpuBuckets {
+  const buckets: GpuBuckets = { ready_now: [], fits_but_queued: [], idle_with_risk: [], unsupported: [], too_small: [] };
+  for (const market of catalog) {
+    const risks: string[] = [];
+    if (req.minVramGb && market.vramGb !== null && market.vramGb < req.minVramGb) {
+      buckets.too_small.push({ market, bucket: 'too_small', risks: [`${market.vramGb} GB VRAM, workload needs ${req.minVramGb} GB`] });
+      continue;
+    }
+    if (req.blackwellOnly && req.isBlackwell && !req.isBlackwell(market)) {
+      buckets.unsupported.push({ market, bucket: 'unsupported', risks: ['not a Blackwell GPU; this workload will not run here'] });
+      continue;
+    }
+    if (req.minVramGb && market.vramGb === null) risks.push('VRAM not published for this market');
+    const idle = market.availableNodes > 0;
+    if (risks.length) {
+      if (idle) buckets.idle_with_risk.push({ market, bucket: 'idle_with_risk', risks });
+      else buckets.fits_but_queued.push({ market, bucket: 'fits_but_queued', risks });
+    } else if (idle) buckets.ready_now.push({ market, bucket: 'ready_now', risks });
+    else buckets.fits_but_queued.push({ market, bucket: 'fits_but_queued', risks });
+  }
+  return buckets;
+}
+
+/** Cheapest GPU that fits and has an idle host, or null when nothing is ready right now. */
+export function autoPickGpu(buckets: GpuBuckets): GpuMarket | null {
+  return buckets.ready_now[0]?.market ?? null;
 }

@@ -1,6 +1,6 @@
 {
   "name": "nosana-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Nosana MCP: let AI agents rent GPUs on the Nosana network and deploy templates such as MiniMax H3 with account credits. Ships the nosana-deploy CLI too.",
   "type": "module",
   "bin": {
@@ -22,7 +22,8 @@
     "start": "node dist/mcp/index.js",
     "test:mcp": "node scripts/smoke-mcp.mjs",
     "inspect": "npx -y @modelcontextprotocol/inspector node dist/mcp/index.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:e2e-llm": "node scripts/e2e-llm.mjs"
   },
   "mcpName": "io.github.SohniSwatantra/nosana-mcp",
   "keywords": [

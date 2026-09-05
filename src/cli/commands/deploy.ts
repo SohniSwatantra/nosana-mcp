@@ -37,6 +37,8 @@ async function watch(client: ReturnType<typeof createClient>, id: string, minute
       } catch {
         /* results may lag */
       }
+    } else if (outcome.kind === 'stopped') {
+      console.log(`${sym.warn} Deployment is ${statusColor(dep.status)}: stopped by you or by its timeout, not failed.`);
     } else if (outcome.kind === 'failed') {
       if (outcome.error) console.log(`${sym.err} Scheduler error: ${outcome.error}`);
       console.log(`${sym.err} Deployment is ${statusColor(outcome.reason)}. See: nosana-deploy deploy events ${dep.id}${outcome.error ? ` and stop it with: nosana-deploy deploy stop ${dep.id}` : ''}`);

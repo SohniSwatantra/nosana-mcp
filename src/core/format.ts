@@ -136,3 +136,26 @@ export function pageSize(requested: number): 10 | 20 | 50 | 100 {
   if (requested <= 50) return 50;
   return 100;
 }
+
+const TRANSIENT = /fetch failed|timed? ?out|ECONN|ENOTFOUND|EAI_AGAIN|socket hang up|\b50[234]\b|Bad Gateway|Service Unavailable|Gateway Time-out/i;
+
+export function isTransientError(error: unknown): boolean {
+  const status = (error as { status?: unknown; statusCode?: unknown }).status ?? (error as { statusCode?: unknown }).statusCode;
+  if (typeof status === 'number' && status >= 500) return true;
+  return TRANSIENT.test(error instanceof Error ? `${error.message} ${(error.cause as Error | undefined)?.message ?? ''}` : String(error));
+}
+
+/** Retry read-only calls on transient network or 5xx failures with exponential backoff. */
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 400): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientError(error) || attempt === attempts - 1) throw error;
+      await sleep(baseDelayMs * 2 ** attempt);
+    }
+  }
+  throw lastError;
+}

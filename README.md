@@ -56,49 +56,67 @@ Instead of the environment variable you can run `nosana-deploy login` once; the 
 
 ### 3. Ask
 
-- "What GPUs fit MiniMax H3 and what do they cost per hour?"
-- "Estimate a 2-hour MiniMax H3 image-to-video deployment on a 5090."
-- "Deploy it." (the agent must show you the estimate and get a yes before it can call `create_deployment`)
-- "Is it online yet?" / "Show me the logs." / "Stop it."
+- "Deploy Qwen 3.6 27B on the cheapest idle GPU and give me the OpenAI-compatible URL."
+- "Deploy MiniMax H3 image-to-video. If no 5090 is idle, show me the alternatives."
+- "What is running right now and what does it cost per hour?" / "Stop everything."
 
-Or use the bundled prompt `deploy_minimax_h3` from your client's prompt picker.
+The agent must show you the estimate and get a yes before it can call `create_deployment`. Bundled prompts: `deploy_template`, `deploy_llm`, `deploy_comfy`, `deploy_minimax_h3`, `stop_when_done`.
+
+After adding or changing the server configuration, restart the client or reconnect its MCP servers (Claude Code: `/mcp`); tools are discovered at session start.
 
 ## Tools
 
+Every tool returns one JSON object, both as text and as MCP `structuredContent`: `{ok, message, next_tool, next_args, ...}`. `ok` is false only when the tool itself failed; deployment outcomes live in `outcome`. Agents never have to parse prose.
+
 | Tool | What it does | Spends credits |
 |---|---|---|
+| `doctor` | Checks the key, credits and every Nosana API; returns the exact fix (install command, restart hint). | no |
 | `get_balance` | Assigned, reserved, settled and available credits. | no |
-| `list_templates` / `get_template` | Catalog with variants, VRAM needs and hardware notes (MiniMax H3 needs a Blackwell GPU). | no |
-| `list_gpus` | Markets with price/h (fee included, matches the dashboard), idle hosts right now, and whether each fits a template. | no |
-| `estimate_deployment` | Dry run: resolves template, variant and GPU, validates, returns cost for one timeout window plus warnings. | no |
-| `create_deployment` | Creates and starts a deployment. Requires `confirm=true`; refuses blocking warnings unless `force=true`. | **yes** |
-| `wait_for_deployment` | Watches up to 120 s per call: `online` (service answers, with URLs), `completed` (with logs), `failed` (with the scheduler error) or `pending`. | no |
-| `get_deployment` / `list_deployments` | Status, endpoints with a real readiness check, recent jobs and events. | no |
+| `list_templates` / `get_template` | Catalog with kind (comfyui, llm, notebook, ide), VRAM from the template itself, variants, hardware notes, typical boot time. | no |
+| `list_gpus` | Markets in buyer buckets: `ready_now` (fits, idle host), `fits_but_queued`, `idle_with_risk`, `unsupported`. Prices per hour include the fee and match the dashboard. | no |
+| `recommend_plan` | One call from a workload ("minimax-h3/i2v-32gb", "qwen3-6-27b", "gemma3 12b", or a job definition) to the cheapest ready GPU, cost, similar deployments already running, and exact `create_deployment` arguments. Never picks a queued or unsupported GPU by itself. | no |
+| `estimate_deployment` | Dry run of `create_deployment` with the same arguments, including `gpu: "auto"`. | no |
+| `create_deployment` | Creates and starts. Needs `confirm=true`. Refuses to queue without `accept_queue`, to duplicate a running workload without `allow_duplicate`, and to use unfit hardware or overspend without `force`. | **yes** |
+| `wait_for_deployment` | Watches up to 45 s per call (MCP clients time out at 60 s). Returns `online` with URLs and usage, `completed` with logs, `stopped` (user or timeout, not an error), `failed` with the scheduler error, or `pending` with phase (`queued`, `starting`, `initializing`), elapsed time and `poll_after_seconds`. | no |
+| `get_deployment` / `list_deployments` | Status, phase, endpoints with a real readiness probe, price per hour, recent jobs and events. | no |
+| `get_endpoint_usage` | How to use the running service: ComfyUI `/prompt` API, OpenAI-compatible base URL for Ollama/vLLM (`/v1/models`, `/v1/chat/completions`), Jupyter/VS Code URL, raw ports for custom jobs. | no |
 | `get_job_result` / `get_deployment_events` | Logs and the scheduler's event log. | no |
 | `stop_deployment` | Stops jobs; billing stops with them. | ends spending |
 | `start_deployment` / `extend_deployment` | Restart a stopped deployment (needs `confirm=true`) or change its timeout. | yes |
 
-Resources: `nosana://templates` and `nosana://gpus`. Prompt: `deploy_minimax_h3`.
+Resources: `nosana://templates`, `nosana://gpus`. Prompts: `deploy_template`, `deploy_llm`, `deploy_comfy`, `deploy_minimax_h3`, `stop_when_done`.
+
+### The happy path an agent follows
+
+```
+recommend_plan("qwen3-6-27b")        -> ready_now GPU, cost, create_args
+create_deployment(create_args, confirm=true)   after the user says yes
+wait_for_deployment(id)  x N          -> pending(phase) ... online
+get_endpoint_usage(id)                -> OPENAI_BASE_URL, /v1/models, curl example
+stop_deployment(id)                   when the user is done
+```
 
 ## Guard rails built in
 
-- **Confirmation before spending.** `create_deployment` and `start_deployment` do nothing without `confirm=true`, and their descriptions tell the agent to show the estimate first. MCP tool annotations mark them as non-read-only so clients prompt for approval.
-- **60-minute minimum.** Nosana only schedules credit-paid jobs of 3600 seconds or more. Shorter deployments are accepted by the API but never run. The server rejects them before anything is created.
-- **Fit checks.** Too little VRAM, a non-Blackwell card for MiniMax H3, or insufficient credits block a deployment unless forced. No idle hosts is reported as an advisory.
-- **Real readiness.** Nosana marks an endpoint online when the host tunnel is up while the container may still be downloading weights. The server probes the URL and only reports `online` once the service answers.
-- **Fail fast.** Repeated scheduler errors (bad timeout, insufficient funds) end the wait with the error text instead of spinning.
-- **Read-only by default.** Everything except create, start, extend and stop is read-only and idempotent.
+- **Confirmation before spending.** `create_deployment` and `start_deployment` do nothing without `confirm=true`; their descriptions tell the agent to show the estimate first, and MCP annotations mark them non-read-only so clients prompt for approval.
+- **No silent queueing.** With `gpu: "auto"` only a GPU that fits *and* has an idle host is chosen. If none is ready, the response lists `fits_but_queued` and `idle_with_risk` and asks for a decision (`accept_queue` or `force`). Unsupported hardware (a non-Blackwell card for MiniMax H3) is never offered, because it would download 45 GB of weights and then fail.
+- **No accidental duplicates.** Creating a workload that is already running is refused unless `allow_duplicate=true`.
+- **60-minute minimum.** Nosana only schedules credit-paid jobs of 3600 seconds or more; shorter values are rejected before anything is created. Workloads that download weights default to 120 minutes.
+- **Real readiness.** Nosana marks an endpoint online when the host tunnel is up while the container may still be loading. The server probes the service itself (`/` for web UIs, `/api/tags` or `/v1/models` for LLMs) before reporting `online`.
+- **Stopped is not failed.** A deployment stopped by the user or its timeout reports `outcome: "stopped"`, so agents do not "fix" it by restarting and paying the boot again.
+- **Fail fast, retry the transient.** Repeated scheduler errors end the wait with the error text; transient 5xx and network blips are retried with backoff.
+- **Short calls.** No tool blocks longer than 45 seconds. Pending results carry `poll_after_seconds` and `next_args` so the agent can loop safely.
 
 ## Costs to expect
 
-Prices come from the live market list and include the network fee, so they match deploy.nosana.com. At the time of writing an RTX 3060 is about $0.05/h, an RTX 4090 about $0.32/h, an RTX 5090 about $0.40/h, an RTX PRO 6000 about $1.00/h. MiniMax H3 32 GB variants need the 5090; the 80 GB variants need the PRO 6000. Credits are reserved when a job is listed and settled for the time actually used; a `SIMPLE` deployment stops on its own at the timeout.
+Prices come from the live market list and include the network fee, so they match deploy.nosana.com. Every plan and every online result carries `usd_per_hour`, `estimated_credits`, `boot_minutes_typical` and the billing rules (idle time bills, there is no pause, stopping ends billing, restarting pays the boot again). See [docs/COST.md](docs/COST.md) for numbers from real runs.
 
 ## Development
 
 ```bash
 npm install
 npm run build
-npm run test:mcp          # read-only smoke test against the live API (needs NOSANA_API_KEY)
+npm run test:mcp          # read-only smoke test with assertions against the live API (needs NOSANA_API_KEY)
 SMOKE_DEPLOY=1 npm run test:mcp   # also deploys hello-world once (about 0.05 credits)
 npm run inspect           # MCP Inspector UI against the built server
 ```

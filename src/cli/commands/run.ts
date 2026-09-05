@@ -255,6 +255,10 @@ async function reportOutcome(outcome: WaitOutcome, options: GlobalOptions): Prom
       }
       return 0;
     }
+    case 'stopped': {
+      console.log(`${sym.warn} The deployment was stopped (by you or by its timeout) before the workload came up. Start it again with: nosana-deploy deploy start ${dep.id} --wait`);
+      return 1;
+    }
     case 'failed': {
       if (outcome.error) {
         console.log(`${sym.err} The scheduler cannot run this deployment: ${pc.red(outcome.error)}`);
