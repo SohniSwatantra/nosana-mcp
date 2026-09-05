@@ -22,6 +22,7 @@ Credits are priced like USD. Credits are reserved when a job is listed and settl
 | hello-world (`echo hello world`) | nvidia-3060 | job completed 5 to 20 s after listing | under 0.001 credits |
 | MiniMax H3 i2v-32gb, 120 min SIMPLE | nvidia-5090 | 4 min queued for an idle host, then about 7 min until ComfyUI returned HTTP 200 | 0.728 credits for the full window |
 | Qwen 3.6 27B (Ollama), via the MCP `recommend_plan` -> `create_deployment` -> `wait_for_deployment` loop | nvidia-3090 | host assigned immediately, 6 min until `/v1/models` answered, stopped right after | about 0.02 credits |
+| MiniMax H3 i2v-32gb again, through the published `npx -y nosana-mcp` package | nvidia-5090 (cold host) | ComfyUI answered well before the 40-minute watch ended, but Nosana's endpoint flag stayed offline for a long time; 0.2.1 probes the URL regardless of that flag | 0.8 credits reserved for the 120-minute window |
 
 The MiniMax boot was fast because the host already had most of the 45 GB of weights cached. A cold host can take 15 minutes or more. Idle time counts: a 5090 left running for an hour after you finish is 0.40 credits gone.
 

@@ -305,13 +305,15 @@ export async function snapshotDeployment(client: NosanaClient, id: string, facts
     dep.getJobs({ limit: 10 }).then((r) => r.jobs as { job: string; state: unknown; node?: string | null; created_at?: string; time_start?: number }[]).catch(() => []),
     dep.getEvents({ limit: 10, sort_order: 'desc' }).then((r) => r.events as { created_at?: string; type?: string; message?: string }[]).catch(() => []),
   ]);
+  const jobRunning = jobsRaw.some((j) => normalizeJobState(j.state) === 'RUNNING');
   const endpoints: EndpointSnapshot[] = await Promise.all(
     (dep.endpoints ?? []).map(async (e) => ({
       url: e.url,
       op: e.opId,
       port: e.port,
       tunnel_online: e.online,
-      service_ready: e.online ? (await probeEndpoint(e.url, resolvedFacts.readinessPath)) === 'ready' : false,
+      // Probe whenever a job runs: the tunnel flag is advisory, the service answering is what counts.
+      service_ready: e.online || jobRunning ? (await probeEndpoint(e.url, resolvedFacts.readinessPath)) === 'ready' : false,
     })),
   );
   const jobs = jobsRaw.slice(0, 5).map((j) => ({ job: j.job, state: normalizeJobState(j.state), node: j.node ?? null, created_at: j.created_at, time_start: j.time_start }));
@@ -447,14 +449,17 @@ export async function waitForDeployment(client: NosanaClient, id: string, option
       const key = `${endpoint.url}:${endpoint.port}`;
       if (endpointStates.get(key) !== endpoint.online) {
         endpointStates.set(key, endpoint.online);
-        log(`endpoint ${endpoint.online ? pc.green('online') : pc.yellow('not reachable yet')} ${endpoint.url}`);
+        log(`endpoint ${endpoint.online ? pc.green('tunnel online') : pc.yellow('tunnel not reported online yet')} ${endpoint.url}`);
       }
     }
     if (expectEndpoint) {
-      const online = (dep.endpoints ?? []).filter((e) => e.online);
-      if (online.length) {
+      // Nosana's "online" flag can lag behind (or never flip) while the service already answers,
+      // so once a job is running we probe every endpoint URL ourselves.
+      const jobRunning = [...jobStates.values()].some((state) => state === 'RUNNING');
+      const candidates = (dep.endpoints ?? []).filter((e) => e.online || jobRunning);
+      if (candidates.length) {
         const readiness = facts.readinessPath;
-        const probes = await Promise.all(online.map(async (e) => ({ url: e.url, state: await probeEndpoint(e.url, readiness) })));
+        const probes = await Promise.all(candidates.map(async (e) => ({ url: e.url, state: await probeEndpoint(e.url, readiness) })));
         const ready = probes.filter((p) => p.state === 'ready').map((p) => p.url);
         if (ready.length) return { kind: 'online', deployment: dep, readyUrls: [...new Set(ready)] };
         if (Date.now() - lastInitializingLog >= 60_000) {

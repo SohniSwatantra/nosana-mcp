@@ -1,6 +1,6 @@
 {
   "name": "nosana-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Nosana MCP: let AI agents rent GPUs on the Nosana network and deploy templates such as MiniMax H3 with account credits. Ships the nosana-deploy CLI too.",
   "type": "module",
   "bin": {
